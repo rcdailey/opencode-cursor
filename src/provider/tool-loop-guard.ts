@@ -517,12 +517,18 @@ function evaluateWithFingerprints(
 
   const isExplorationTool = EXPLORATION_TOOLS.has(toolName.toLowerCase());
   if (isExplorationTool) {
+    // Exploration tools get a higher error limit because they commonly iterate
+    // over many URLs/files/patterns. The shape-based strict fingerprint groups
+    // all calls with the same arg types together (e.g. all webfetch calls with
+    // {url: string, format: string}), so we need a higher limit to allow the
+    // agent to try several targets before giving up.
+    const explorationMaxRepeat = maxRepeat * EXPLORATION_LIMIT_MULTIPLIER;
     return {
       fingerprint: strictFingerprint,
       repeatCount: strictRepeatCount,
-      maxRepeat,
+      maxRepeat: explorationMaxRepeat,
       errorClass,
-      triggered: strictTriggered,
+      triggered: strictRepeatCount > explorationMaxRepeat,
       tracked: true,
     };
   }
