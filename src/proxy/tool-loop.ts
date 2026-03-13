@@ -81,6 +81,9 @@ const TOOL_NAME_ALIASES = new Map<string, string>([
   ["readtodostoolcall", "todoread"],
   ["todoread", "todoread"],
   ["todoreadtoolcall", "todoread"],
+  // search_replace → edit (Cursor's surgical edit tool)
+  ["searchreplace", "edit"],
+  ["search_replace", "edit"],
   // sub-agent and delegation aliases
   ["callomoagent", "call_omo_agent"],
   ["callagent", "call_omo_agent"],
@@ -119,6 +122,7 @@ export function extractOpenAiToolCall(
   }
 
   const { name, args, skipped } = extractToolNameAndArgs(event);
+  log.info("extractOpenAiToolCall", { name, skipped, hasArgs: args !== undefined, subtype: event.subtype });
   if (skipped) {
     return { action: "skip", skipReason: "event_skipped" };
   }
@@ -127,6 +131,7 @@ export function extractOpenAiToolCall(
   }
 
   const resolvedName = resolveAllowedToolName(name, allowedToolNames);
+  log.info("extractOpenAiToolCall resolved", { name, resolvedName, argsPreview: typeof args === "object" && args ? JSON.stringify(args).slice(0, 200) : String(args) });
   if (resolvedName) {
     // Known tool → intercept and forward to OpenCode
     if (args === undefined && event.subtype === "started") {

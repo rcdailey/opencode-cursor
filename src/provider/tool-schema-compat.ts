@@ -1,20 +1,14 @@
 import type { OpenAiToolCall } from "../proxy/tool-loop.js";
+import { createLogger } from "../utils/logger.js";
+
+const log = createLogger("tool-schema-compat");
 
 type JsonRecord = Record<string, unknown>;
 
-const EDIT_COMPAT_REPAIR_ENABLED = process.env.CURSOR_ACP_EDIT_COMPAT_REPAIR !== "false";
-
+// Global argument key aliases. These apply to all tools before tool-specific
+// normalization runs. Keys that are tool-dependent (e.g. filepath -> filePath
+// vs filepath -> path) should NOT go here; use normalizeToolSpecificArgs.
 const ARG_KEY_ALIASES = new Map<string, string>([
-  ["filepath", "path"],
-  ["filename", "path"],
-  ["file", "path"],
-  ["targetpath", "path"],
-  ["directorypath", "path"],
-  ["dir", "path"],
-  ["folder", "path"],
-  ["directory", "path"],
-  ["targetdirectory", "path"],
-  ["targetfile", "path"],
   ["globpattern", "pattern"],
   ["filepattern", "pattern"],
   ["searchpattern", "pattern"],
@@ -33,8 +27,8 @@ const ARG_KEY_ALIASES = new Map<string, string>([
   ["payload", "content"],
   ["streamcontent", "content"],
   ["recursive", "force"],
-  ["oldstring", "old_string"],
-  ["newstring", "new_string"],
+  ["oldstring", "oldString"],
+  ["newstring", "newString"],
 ]);
 
 export interface ToolSchemaValidationResult {
@@ -53,6 +47,7 @@ export interface ToolSchemaCompatResult {
   normalizedArgKeys: string[];
   collisionKeys: string[];
   validation: ToolSchemaValidationResult;
+  preSanitizationArgs: JsonRecord;
 }
 
 export function buildToolSchemaMap(tools: Array<unknown>): Map<string, unknown> {
@@ -78,6 +73,10 @@ export function applyToolSchemaCompat(
   toolCall: OpenAiToolCall,
   toolSchemaMap: Map<string, unknown>,
 ): ToolSchemaCompatResult {
+  log.info("applyToolSchemaCompat entry", {
+    tool: toolCall.function.name,
+    rawArgs: toolCall.function.arguments.slice(0, 200),
+  });
   const parsedArgs = parseArguments(toolCall.function.arguments);
   const originalArgKeys = Object.keys(parsedArgs);
   const { normalizedArgs, collisionKeys } = normalizeArgumentKeys(parsedArgs);
@@ -99,11 +98,20 @@ export function applyToolSchemaCompat(
     },
   };
 
+  const normalizedArgKeys = Object.keys(sanitization.args);
+  log.info("Tool schema compat", {
+    tool: toolCall.function.name,
+    incoming: originalArgKeys,
+    outgoing: normalizedArgKeys,
+    validationOk: validation.ok,
+  });
+
   return {
     toolCall: normalizedToolCall,
     normalizedArgs: sanitization.args,
+    preSanitizationArgs: toolSpecificArgs,
     originalArgKeys,
-    normalizedArgKeys: Object.keys(sanitization.args),
+    normalizedArgKeys,
     collisionKeys,
     validation,
   };
@@ -154,8 +162,86 @@ function resolveCanonicalArgKey(rawKey: string): string | null {
   return ARG_KEY_ALIASES.get(token) ?? null;
 }
 
+function asInt(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return Math.floor(value);
+  }
+  if (typeof value === "string") {
+    const n = parseInt(value, 10);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+// Resolve various file/path argument names to the canonical key for a tool.
+// Tools like read/edit/write use "filePath"; tools like grep/glob use "path".
+function resolveFilePathArg(args: JsonRecord, canonicalKey: string): void {
+  if (args[canonicalKey] !== undefined) return;
+  for (const alias of [
+    "target_file", "targetfile", "filepath", "filePath", "file_path",
+    "filename", "file", "path", "targetpath",
+    "relative_workspace_path", "relativeworkspacepath",
+    "dir", "folder", "directory", "directorypath", "targetdirectory",
+  ]) {
+    if (alias === canonicalKey) continue;
+    if (typeof args[alias] === "string" && args[alias].toString().trim().length > 0) {
+      args[canonicalKey] = args[alias];
+      delete args[alias];
+      return;
+    }
+  }
+}
+
 function normalizeToolSpecificArgs(toolName: string, args: JsonRecord): JsonRecord {
   const normalizedToolName = toolName.toLowerCase();
+
+  // Tools that use "filePath" as the canonical file argument
+  if (normalizedToolName === "read" || normalizedToolName === "edit" || normalizedToolName === "write") {
+    const normalized: JsonRecord = { ...args };
+    resolveFilePathArg(normalized, "filePath");
+
+    if (normalizedToolName === "read") {
+      // Convert Cursor's inclusive line range to offset/limit
+      const start = asInt(normalized["start_line_one_indexed"]);
+      const end = asInt(normalized["end_line_one_indexed_inclusive"]);
+      if (start != null && normalized.offset === undefined) {
+        normalized.offset = start;
+      }
+      if (start != null && end != null && end >= start && normalized.limit === undefined) {
+        normalized.limit = end - start + 1;
+      }
+      delete normalized["start_line_one_indexed"];
+      delete normalized["end_line_one_indexed_inclusive"];
+      delete normalized["should_read_entire_file"];
+    }
+
+    // Strip Cursor-specific params that have no OpenCode equivalent
+    delete normalized["explanation"];
+    delete normalized["instructions"];
+
+    // Fall through to write/edit-specific handling below for those tools
+    if (normalizedToolName === "read") return normalized;
+    args = normalized;
+  }
+
+  // Tools that use "path" as the canonical file/directory argument
+  if (normalizedToolName === "grep" || normalizedToolName === "glob") {
+    const normalized: JsonRecord = { ...args };
+    resolveFilePathArg(normalized, "path");
+
+    // Cursor's grep_search uses "query"; OpenCode grep uses "pattern"
+    if (normalized.pattern === undefined && typeof normalized.query === "string") {
+      normalized.pattern = normalized.query;
+      delete normalized.query;
+    }
+
+    // Cursor's include_pattern -> OpenCode's include (already handled by global alias)
+    delete normalized["exclude_pattern"];
+    delete normalized["case_sensitive"];
+    delete normalized["explanation"];
+    return normalized;
+  }
+
   if (normalizedToolName === "bash") {
     const normalized: JsonRecord = { ...args };
     const normalizedCommand = normalizeBashCommand(normalized.command);
@@ -169,6 +255,19 @@ function normalizeToolSpecificArgs(toolName: string, args: JsonRecord): JsonReco
     ) {
       normalized.cwd = normalized.path;
     }
+    // Cursor-specific params with no OpenCode equivalent
+    delete normalized["is_background"];
+    delete normalized["require_user_approval"];
+    delete normalized["explanation"];
+    return normalized;
+  }
+
+  if (normalizedToolName === "webfetch") {
+    const normalized: JsonRecord = { ...args };
+    if (normalized.format === undefined) {
+      normalized.format = "markdown";
+    }
+    delete normalized["explanation"];
     return normalized;
   }
 
@@ -220,12 +319,12 @@ function normalizeToolSpecificArgs(toolName: string, args: JsonRecord): JsonReco
 
     // Some model variants confuse write/edit and send edit-style payload keys.
     // Map them into canonical write arguments before schema validation/sanitization.
-    if (normalized.content === undefined && normalized.new_string !== undefined) {
-      const coerced = coerceToString(normalized.new_string);
+    if (normalized.content === undefined && normalized.newString !== undefined) {
+      const coerced = coerceToString(normalized.newString);
       if (coerced !== null) {
         normalized.content = coerced;
       }
-      delete normalized.new_string;
+      delete normalized.newString;
     }
 
     if (normalized.content !== undefined && typeof normalized.content !== "string") {
@@ -238,34 +337,21 @@ function normalizeToolSpecificArgs(toolName: string, args: JsonRecord): JsonReco
     return normalized;
   }
 
-  if (normalizedToolName !== "edit" || !EDIT_COMPAT_REPAIR_ENABLED) {
-    return args;
-  }
-
-  const repaired: JsonRecord = { ...args };
-  const hasStringNew = typeof repaired.new_string === "string";
-  const hasStringOld = typeof repaired.old_string === "string";
-
-  // Coerce non-string content/streamContent into a string before repair.
-  // Models frequently emit array-of-chunks (streamContent) or object payloads.
-  if (repaired.content !== undefined && typeof repaired.content !== "string") {
-    const coerced = coerceToString(repaired.content);
-    if (coerced !== null) {
-      repaired.content = coerced;
+  // For edit: coerce non-string content but do NOT synthesize oldString/newString.
+  // edit_file-style calls (content without oldString) are handled by the
+  // edit-file-resolver in runtime-interception, not by repair logic here.
+  if (normalizedToolName === "edit") {
+    const repaired: JsonRecord = { ...args };
+    if (repaired.content !== undefined && typeof repaired.content !== "string") {
+      const coerced = coerceToString(repaired.content);
+      if (coerced !== null) {
+        repaired.content = coerced;
+      }
     }
+    return repaired;
   }
 
-  const content = repaired.content;
-
-  // Guarded compatibility repair for models that send full-content edit payloads.
-  if (!hasStringNew && typeof content === "string") {
-    repaired.new_string = content;
-  }
-  if (typeof repaired.new_string === "string" && !hasStringOld) {
-    repaired.old_string = "";
-  }
-
-  return repaired;
+  return args;
 }
 
 function normalizeBashCommand(value: unknown): string | null {
@@ -421,9 +507,9 @@ function buildRepairHint(
   }
   if (
     toolName.toLowerCase() === "edit"
-    && (missing.includes("old_string") || missing.includes("new_string"))
+    && (missing.includes("oldString") || missing.includes("newString"))
   ) {
-    hints.push("edit requires path, old_string, and new_string");
+    hints.push("edit requires filePath, oldString, and newString");
   }
   return hints.join(" | ");
 }

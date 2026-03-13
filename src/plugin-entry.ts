@@ -11,6 +11,8 @@ import { createLogger } from "./utils/logger.js";
 
 const log = createLogger("plugin-entry");
 
+log.info("Loading cursor-acp plugin from source", { path: import.meta.url });
+
 const CursorPluginEntry: Plugin = async (input) => {
   const state = shouldEnableCursorPlugin();
   if (!state.enabled) {
